@@ -36,6 +36,8 @@
     color: #ffd866;
     text-shadow: 0 0 8px rgba(255,216,102,0.5);
     margin-bottom: 12px;
+    cursor: pointer;
+    user-select: none;
   }
 
   #game-shell {
@@ -52,6 +54,25 @@
     display: block;
     image-rendering: pixelated;
     image-rendering: crisp-edges;
+  }
+
+  /* full-screen flash overlay driven by JS */
+  #flash-overlay {
+    position: absolute; inset: 0;
+    background: #fff;
+    pointer-events: none;
+    opacity: 0;
+    z-index: 7;
+    mix-blend-mode: screen;
+    transition: opacity 60ms linear;
+  }
+  #red-overlay {
+    position: absolute; inset: 0;
+    background: radial-gradient(circle at center, rgba(255,60,60,0) 30%, rgba(255,60,60,0.55) 100%);
+    pointer-events: none;
+    opacity: 0;
+    z-index: 6;
+    mix-blend-mode: screen;
   }
 
   .hud {
@@ -75,10 +96,16 @@
   }
   .hp-fill {
     height: 100%;
-    transition: width 0.2s ease-out;
+    transition: width 0.18s cubic-bezier(.2,.9,.3,1.3);
   }
   .hp-fill.p1 { background: linear-gradient(90deg, #ff4d6d, #ff8fa3); }
   .hp-fill.p2 { background: linear-gradient(90deg, #4d9fff, #8fbeff); }
+  /* pulsing bar on low HP */
+  .hp-fill.low { animation: pulseLow 0.6s infinite; }
+  @keyframes pulseLow {
+    0%, 100% { filter: brightness(1); }
+    50% { filter: brightness(1.6); }
+  }
 
   .center-banner {
     position: absolute;
@@ -88,12 +115,16 @@
     color: #ffd866;
     text-shadow: 2px 2px 0 #000, 0 0 16px rgba(255,216,102,0.6);
     text-align: center;
-    z-index: 6;
+    z-index: 9;
     pointer-events: none;
     opacity: 0;
-    transition: opacity 0.3s;
+    transform-origin: center;
+    transition: opacity 0.25s, transform 0.3s cubic-bezier(.2,1.6,.3,1);
   }
-  .center-banner.show { opacity: 1; }
+  .center-banner.show {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
   .center-banner .sub {
     display: block;
     font-size: 8px;
@@ -112,13 +143,26 @@
   .controls-hint span.p1 { color: #ff8fa3; }
   .controls-hint span.p2 { color: #8fbeff; }
 
-  .tag {
-    position: absolute;
-    bottom: -22px;
-    font-size: 6px;
-    color: #4a4a6a;
-    letter-spacing: 1px;
+  /* status icons row */
+  .status-row {
+    margin-top: 10px;
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    align-items: center;
+    font-size: 7px;
+    color: #5a5a7a;
   }
+  .chip {
+    padding: 4px 8px;
+    border: 1px solid #3a3a5c;
+    border-radius: 3px;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .chip:hover { color: #ffd866; border-color: #ffd866; }
+  .chip.on { color: #ffd866; border-color: #ffd866; }
 </style>
 </head>
 <body>
@@ -139,6 +183,8 @@
     </div>
   </div>
 
+  <div id="flash-overlay"></div>
+  <div id="red-overlay"></div>
   <div id="banner" class="center-banner"></div>
 </div>
 
@@ -148,8 +194,16 @@
   <br>按 <span style="color:#ffd866">SPACE</span> 开始 / 重开
 </div>
 
+<div class="status-row">
+  <span id="chip-sfx" class="chip on">SFX ♪ ON</span>
+  <span id="chip-bgm" class="chip on">BGM ♫ ON</span>
+  <span style="opacity:0.5">按键切换</span>
+</div>
+
 <script>
 (() => {
+  'use strict';
+
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
   ctx.imageSmoothingEnabled = false;
@@ -160,212 +214,237 @@
   const GRAVITY = 0.55;
   const SCALE = 2.5;
 
-  // ---------- PIXEL ART: MECHA SPRITES ----------
-  // Each frame is a 24x32 grid drawn with color codes
-  // ' ' = transparent
-  // Palette:
-  //  P1 (red): a=darkred b=red c=orange d=yellow e=dark
-  //  P2 (blue): a=darkblue b=blue c=cyan d=light e=dark
+  // ================================================================
+  // CONFIG — tune feel here
+  // ================================================================
+  const CFG = {
+    hitstopNormal: 6,       // frames frozen on normal hit
+    hitstopHeavy: 10,       // frames frozen on KO
+    hitstopBlock: 3,        // frames frozen on blocked hit
+    shakeNormal: 2.5,
+    shakeHeavy: 4.5,
+    shakeBlock: 1.2,
+    attackWindup: 6,        // frames before swing damage becomes active
+    attackActive: 14,       // frames the swing hitbox is live
+    attackRecover: 18,      // cooldown frames after active
+    damageNumberLife: 40,
+    damageNumberRise: 0.9,
+  };
 
+  // ================================================================
+  // AUDIO — procedural chiptune SFX + BGM via Web Audio API
+  // ================================================================
+  const Audio = (() => {
+    let ctx = null;
+    let masterGain, sfxGain, bgmGain;
+    let started = false;
+    let bgmNodes = null;
+    let bgmTimer = null;
+    let mutedSFX = false, mutedBGM = false;
+
+    function ensure() {
+      if (started) return true;
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        ctx = new AC();
+        masterGain = ctx.createGain(); masterGain.gain.value = 0.6; masterGain.connect(ctx.destination);
+        sfxGain = ctx.createGain(); sfxGain.gain.value = 0.9; sfxGain.connect(masterGain);
+        bgmGain = ctx.createGain(); bgmGain.gain.value = 0.28; bgmGain.connect(masterGain);
+        started = true;
+        return true;
+      } catch (e) { return false; }
+    }
+
+    function resume() {
+      if (ctx && ctx.state === 'suspended') ctx.resume();
+    }
+
+    // --- SFX ---
+    // Generic envelope tone
+    function tone({ freq=440, endFreq=null, type='square', dur=0.1, vol=0.3, attack=0.005, release=0.05 }) {
+      if (!started || mutedSFX) return;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, ctx.currentTime);
+      if (endFreq != null) o.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), ctx.currentTime + dur);
+      g.gain.setValueAtTime(0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(vol, ctx.currentTime + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur + release);
+      o.connect(g); g.connect(sfxGain);
+      o.start();
+      o.stop(ctx.currentTime + dur + release + 0.02);
+    }
+
+    // Noise burst (for hits / sparks / jump whoosh)
+    function noise({ dur=0.08, vol=0.3, filterFreq=1500, filter='lowpass' }) {
+      if (!started || mutedSFX) return;
+      const bufferSize = Math.floor(ctx.sampleRate * dur);
+      const buf = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 2);
+      }
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const filt = ctx.createBiquadFilter(); filt.type = filter; filt.frequency.value = filterFreq;
+      const g = ctx.createGain(); g.gain.value = vol;
+      src.connect(filt); filt.connect(g); g.connect(sfxGain);
+      src.start();
+      src.stop(ctx.currentTime + dur);
+    }
+
+    const SFX = {
+      swing() {
+        // air-swoosh + rising pitch
+        noise({ dur: 0.09, vol: 0.18, filterFreq: 900, filter: 'bandpass' });
+        tone({ freq: 520, endFreq: 180, type: 'triangle', dur: 0.08, vol: 0.2 });
+      },
+      hitNormal() {
+        // heavy thud + metallic clink
+        tone({ freq: 160, endFreq: 50, type: 'square', dur: 0.12, vol: 0.35, release: 0.08 });
+        noise({ dur: 0.06, vol: 0.35, filterFreq: 2400, filter: 'bandpass' });
+      },
+      hitDefend() {
+        // bright shield clink
+        tone({ freq: 900, endFreq: 1600, type: 'square', dur: 0.07, vol: 0.3, release: 0.05 });
+        noise({ dur: 0.05, vol: 0.2, filterFreq: 4000, filter: 'highpass' });
+      },
+      jump() {
+        tone({ freq: 300, endFreq: 700, type: 'square', dur: 0.12, vol: 0.25 });
+      },
+      land() {
+        noise({ dur: 0.05, vol: 0.2, filterFreq: 600 });
+      },
+      ko() {
+        // descending wail + explosion
+        tone({ freq: 600, endFreq: 80, type: 'sawtooth', dur: 0.5, vol: 0.35, release: 0.1 });
+        setTimeout(() => noise({ dur: 0.35, vol: 0.5, filterFreq: 1200, filter: 'lowpass' }), 180);
+      },
+      roundStart() {
+        tone({ freq: 440, type: 'square', dur: 0.08, vol: 0.25 });
+        setTimeout(() => tone({ freq: 660, type: 'square', dur: 0.08, vol: 0.25 }), 110);
+        setTimeout(() => tone({ freq: 880, type: 'square', dur: 0.14, vol: 0.28 }), 220);
+      },
+    };
+
+    // --- BGM — simple chiptune loop ---
+    // lead melody notes (Hz)
+    const MELODY = [262, 330, 392, 523, 440, 392, 330, 262, 220, 262, 330, 392, 349, 294, 262, 220];
+    const BASS   = [131, 131, 147, 147, 165, 165, 131, 131, 110, 110, 131, 131, 147, 147, 131, 131];
+    let melodyIdx = 0, bassIdx = 0;
+
+    function playNote(freq, type, vol, dur) {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(0, ctx.currentTime);
+      g.gain.linearRampToValueAtTime(vol, ctx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+      o.connect(g); g.connect(bgmGain);
+      o.start();
+      o.stop(ctx.currentTime + dur + 0.02);
+    }
+
+    function bgmTick() {
+      if (!started || mutedBGM) return;
+      playNote(MELODY[melodyIdx % MELODY.length], 'square', 0.15, 0.22);
+      if (melodyIdx % 2 === 0) {
+        playNote(BASS[bassIdx % BASS.length], 'triangle', 0.22, 0.32);
+        bassIdx++;
+      }
+      melodyIdx++;
+    }
+
+    function startBGM() {
+      if (!started || bgmTimer) return;
+      melodyIdx = 0; bassIdx = 0;
+      bgmTick();
+      bgmTimer = setInterval(bgmTick, 260);
+    }
+    function stopBGM() {
+      if (bgmTimer) { clearInterval(bgmTimer); bgmTimer = null; }
+    }
+
+    return {
+      init() { if (ensure()) { resume(); startBGM(); return true; } return false; },
+      resume,
+      sfx: SFX,
+      setSFXMuted(v) { mutedSFX = v; if (sfxGain) sfxGain.gain.value = v ? 0 : 0.9; },
+      setBGMMuted(v) { mutedBGM = v; if (bgmGain) bgmGain.gain.value = v ? 0 : 0.28; },
+      isSFXMuted: () => mutedSFX,
+      isBGMMuted: () => mutedBGM,
+    };
+  })();
+
+  // ================================================================
+  // PIXEL ART: MECHA SPRITES
+  // ================================================================
   const PALETTES = {
     p1: { 'a':'#7a1a28', 'b':'#e63946', 'c':'#ff7b54', 'd':'#ffd166', 'e':'#1a0a0e', 's':'#c0c0c0', 'g':'#4a4a4a' },
     p2: { 'a':'#142850', 'b':'#2b78e4', 'c':'#5bc0eb', 'd':'#a8dadc', 'e':'#0a1428', 's':'#c0c0c0', 'g':'#4a4a4a' }
   };
 
-  // 24 wide x 32 tall, facing RIGHT. Flip for left.
-  // IDLE frame (both mechas share structure, colors applied per palette)
   const SPRITES = {
     idle: [
-      "      eeee             ",
-      "     ebbbbe            ",
-      "     ebcbbe            ",
-      "     ebccbe   ss       ",
-      "     ebcbbe   ss       ",
-      "      ebbbe            ",
-      "    eeeeeee            ",
-      "   eabbbbbae           ",
-      "   eabcccbae   ssss    ",
-      "   eabbdccae  sdddds   ",
-      "   eabcccae  sddddd s  ",
-      "   eabbbbae  sddddd s  ",
-      "   eaaaaae   sdddd s   ",
-      "    eeeee    ssss s    ",
-      "     aaaa    ss  s     ",
-      "     aaaa    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     aaaa    gggg      ",
-      "    ea  ae  gg  gg     ",
-      "    ea  ae  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
+      "      eeee             ","     ebbbbe            ","     ebcbbe            ","     ebccbe   ss       ",
+      "     ebcbbe   ss       ","      ebbbe            ","    eeeeeee            ","   eabbbbbae           ",
+      "   eabcccbae   ssss    ","   eabbdccae  sdddds   ","   eabcccae  sddddd s  ","   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ","    eeeee    ssss s    ","     aaaa    ss  s     ","     aaaa    ss  s     ",
+      "     abba    ss  s     ","     abba    ss  s     ","     abba    ss  s     ","     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ","    ea  ae  gg  gg     ","    eb  be  gg  gg     ","    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ","   eeb  bee gg  gg     ","   eeb  bee gg  gg     ","   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ","   e      e  ee ee     ","   e      e  ee ee     ","   e      e  ee ee     ",
     ],
-
-    // walk frame (legs offset)
     walk1: [
-      "      eeee             ",
-      "     ebbbbe            ",
-      "     ebcbbe            ",
-      "     ebccbe   ss       ",
-      "     ebcbbe   ss       ",
-      "      ebbbe            ",
-      "    eeeeeee            ",
-      "   eabbbbbae           ",
-      "   eabcccbae   ssss    ",
-      "   eabbdccae  sdddds   ",
-      "   eabcccae  sddddd s  ",
-      "   eabbbbae  sddddd s  ",
-      "   eaaaaae   sdddd s   ",
-      "    eeeee    ssss s    ",
-      "     aaaa    ss  s     ",
-      "     aaaa    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     aaaa    gggg      ",
-      "    ea  ae   gg gg     ",
-      "   ea    ae  gg gg     ",
-      "   eb    be  gg gg     ",
-      "   eb    be  gg  gg    ",
-      "   eb    be  gg  gg    ",
-      "  eeb    bee gg  gg    ",
-      "  eeb    bee gg  gg    ",
-      "  ee      ee gg  gg    ",
-      "  ee      ee gg  gg    ",
-      "  e        e  ee ee    ",
-      "  e        e  ee ee    ",
-      "  e        e  ee ee    ",
+      "      eeee             ","     ebbbbe            ","     ebcbbe            ","     ebccbe   ss       ",
+      "     ebcbbe   ss       ","      ebbbe            ","    eeeeeee            ","   eabbbbbae           ",
+      "   eabcccbae   ssss    ","   eabbdccae  sdddds   ","   eabcccae  sddddd s  ","   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ","    eeeee    ssss s    ","     aaaa    ss  s     ","     aaaa    ss  s     ",
+      "     abba    ss  s     ","     abba    ss  s     ","     abba    ss  s     ","     aaaa    gggg      ",
+      "    ea  ae   gg gg     ","   ea    ae  gg gg     ","   eb    be  gg gg     ","   eb    be  gg  gg    ",
+      "   eb    be  gg  gg    ","  eeb    bee gg  gg    ","  eeb    bee gg  gg    ","  ee      ee gg  gg    ",
+      "  ee      ee gg  gg    ","  e        e  ee ee    ","  e        e  ee ee    ","  e        e  ee ee    ",
     ],
-
     walk2: [
-      "      eeee             ",
-      "     ebbbbe            ",
-      "     ebcbbe            ",
-      "     ebccbe   ss       ",
-      "     ebcbbe   ss       ",
-      "      ebbbe            ",
-      "    eeeeeee            ",
-      "   eabbbbbae           ",
-      "   eabcccbae   ssss    ",
-      "   eabbdccae  sdddds   ",
-      "   eabcccae  sddddd s  ",
-      "   eabbbbae  sddddd s  ",
-      "   eaaaaae   sdddd s   ",
-      "    eeeee    ssss s    ",
-      "     aaaa    ss  s     ",
-      "     aaaa    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     aaaa    gggg      ",
-      "    ea  ae  gg  gg     ",
-      "    ea  ae  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
+      "      eeee             ","     ebbbbe            ","     ebcbbe            ","     ebccbe   ss       ",
+      "     ebcbbe   ss       ","      ebbbe            ","    eeeeeee            ","   eabbbbbae           ",
+      "   eabcccbae   ssss    ","   eabbdccae  sdddds   ","   eabcccae  sddddd s  ","   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ","    eeeee    ssss s    ","     aaaa    ss  s     ","     aaaa    ss  s     ",
+      "     abba    ss  s     ","     abba    ss  s     ","     abba    ss  s     ","     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ","    ea  ae  gg  gg     ","    eb  be  gg  gg     ","    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ","   eeb  bee gg  gg     ","   eeb  bee gg  gg     ","   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ","   e      e  ee ee     ","   e      e  ee ee     ","   e      e  ee ee     ",
     ],
-
-    // attack frame - sword extended forward
     attack: [
-      "      eeee         ss  ",
-      "     ebbbbe        sss ",
-      "     ebcbbe       sss  ",
-      "     ebccbe       ss   ",
-      "     ebcbbe            ",
-      "      ebbbe            ",
-      "    eeeeeee            ",
-      "   eabbbbbae           ",
-      "   eabcccbae   ssss    ",
-      "   eabbdccae  sdddds   ",
-      "   eabcccae  sddddd s  ",
-      "   eabbbbae  sddddd s  ",
-      "   eaaaaae   sdddd s   ",
-      "    eeeee    ssss s    ",
-      "     aaaa    ss  s     ",
-      "     aaaa    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     abba    ss  s     ",
-      "     aaaa    gggg      ",
-      "    ea  ae  gg  gg     ",
-      "    ea  ae  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "    eb  be  gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
+      "      eeee         ss  ","     ebbbbe        sss ","     ebcbbe       sss  ","     ebccbe       ss   ",
+      "     ebcbbe            ","      ebbbe            ","    eeeeeee            ","   eabbbbbae           ",
+      "   eabcccbae   ssss    ","   eabbdccae  sdddds   ","   eabcccae  sddddd s  ","   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ","    eeeee    ssss s    ","     aaaa    ss  s     ","     aaaa    ss  s     ",
+      "     abba    ss  s     ","     abba    ss  s     ","     abba    ss  s     ","     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ","    ea  ae  gg  gg     ","    eb  be  gg  gg     ","    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ","   eeb  bee gg  gg     ","   eeb  bee gg  gg     ","   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ","   e      e  ee ee     ","   e      e  ee ee     ","   e      e  ee ee     ",
     ],
-
-    // defend frame - shield up
     defend: [
-      "      eeee            g",
-      "     ebbbbe           gg",
-      "     ebcbbe          ggg",
-      "     ebccbe    ss    ggg",
-      "     ebcbbe    ss   gggg",
-      "      ebbbe        gggg",
-      "    eeeeeee       ggggg",
-      "   eabbbbbae      ggggg",
-      "   eabcccbae  ssssggggg",
-      "   eabbdccae sddddggggg",
-      "   eabcccae sddddd gggg",
-      "   eabbbbae sddddd gggg",
-      "   eaaaaae  sdddd  gggg",
-      "    eeeee   ssss   ggg ",
-      "     aaaa   ss  s   gg ",
-      "     aaaa   ss  s   gg ",
-      "     abba   ss  s   g  ",
-      "     abba   ss  s      ",
-      "     abba   ss  s      ",
-      "     aaaa   gggg       ",
-      "    ea  ae gg  gg      ",
-      "    ea  ae gg  gg      ",
-      "    eb  be gg  gg      ",
-      "    eb  be gg  gg      ",
-      "    eb  be gg  gg      ",
-      "   eeb  bee gg  gg     ",
-      "   eeb  bee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   ee    ee gg  gg     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
-      "   e      e  ee ee     ",
+      "      eeee            g","     ebbbbe           gg","     ebcbbe          ggg","     ebccbe    ss    ggg",
+      "     ebcbbe    ss   gggg","      ebbbe        gggg","    eeeeeee       ggggg","   eabbbbbae      ggggg",
+      "   eabcccbae  ssssggggg","   eabbdccae sddddggggg","   eabcccae sddddd gggg","   eabbbbae sddddd gggg",
+      "   eaaaaae  sdddd  gggg","    eeeee   ssss   ggg ","     aaaa   ss  s   gg ","     aaaa   ss  s   gg ",
+      "     abba   ss  s   g  ","     abba   ss  s      ","     abba   ss  s      ","     aaaa   gggg       ",
+      "    ea  ae gg  gg      ","    ea  ae gg  gg      ","    eb  be gg  gg      ","    eb  be gg  gg      ",
+      "    eb  be gg  gg      ","   eeb  bee gg  gg     ","   eeb  bee gg  gg     ","   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ","   e      e  ee ee     ","   e      e  ee ee     ","   e      e  ee ee     ",
     ]
   };
 
-  function drawSprite(spriteName, x, y, facing, paletteKey, flash=false) {
+  function drawSprite(spriteName, x, y, facing, paletteKey, flash=false, tint=null) {
     const sprite = SPRITES[spriteName];
     if (!sprite) return;
     const pal = PALETTES[paletteKey];
     const flip = facing === 'left';
     ctx.save();
-    if (flip) {
-      ctx.translate(x + sprite[0].length, y);
-      ctx.scale(-1, 1);
-    } else {
-      ctx.translate(x, y);
-    }
+    if (flip) { ctx.translate(x + sprite[0].length, y); ctx.scale(-1, 1); }
+    else { ctx.translate(x, y); }
     for (let row = 0; row < sprite.length; row++) {
       const line = sprite[row];
       for (let col = 0; col < line.length; col++) {
@@ -373,6 +452,7 @@
         if (ch === ' ') continue;
         let color = pal[ch] || '#fff';
         if (flash && ch !== 'e') color = '#fff';
+        if (tint) color = tint;
         ctx.fillStyle = color;
         ctx.fillRect(col, row, 1, 1);
       }
@@ -380,48 +460,37 @@
     ctx.restore();
   }
 
-  // ---------- BACKGROUND ----------
+  // ================================================================
+  // BACKGROUND
+  // ================================================================
   const stars = [];
   for (let i = 0; i < 60; i++) {
-    stars.push({
-      x: Math.random() * W,
-      y: Math.random() * (GROUND_Y - 30),
-      b: Math.random()
-    });
+    stars.push({ x: Math.random() * W, y: Math.random() * (GROUND_Y - 30), b: Math.random() });
   }
-
-  // city buildings silhouette
   const buildings = [];
   (() => {
     let x = 0;
     while (x < W) {
       const bw = 10 + Math.floor(Math.random() * 18);
       const bh = 20 + Math.floor(Math.random() * 50);
-      buildings.push({ x, w: bw, h: bh });
+      buildings.push({ x, w: bw, h: bh, seed: Math.random() });
       x += bw + 1;
     }
   })();
 
   function drawBackground() {
-    // sky gradient (dithered)
     for (let y = 0; y < GROUND_Y; y++) {
-      const ratio = y / GROUND_Y;
-      const r = Math.floor(20 + 40 * ratio);
-      const g = Math.floor(10 + 20 * ratio);
-      const b = Math.floor(40 + 60 * ratio);
+      const r = Math.floor(20 + 40 * (y / GROUND_Y));
+      const g = Math.floor(10 + 20 * (y / GROUND_Y));
+      const b = Math.floor(40 + 60 * (y / GROUND_Y));
       ctx.fillStyle = `rgb(${r},${g},${b})`;
       ctx.fillRect(0, y, W, 1);
     }
-
     // moon
     ctx.fillStyle = '#f0c674';
-    ctx.beginPath();
-    ctx.arc(260, 40, 14, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(260, 40, 14, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = '#0a0a14';
-    ctx.beginPath();
-    ctx.arc(255, 36, 13, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(255, 36, 13, 0, Math.PI * 2); ctx.fill();
 
     // stars
     for (const s of stars) {
@@ -430,15 +499,13 @@
       ctx.fillRect(Math.floor(s.x), Math.floor(s.y), 1, 1);
     }
 
-    // distant buildings
     for (const b of buildings) {
       ctx.fillStyle = '#1a1a2e';
       ctx.fillRect(b.x, GROUND_Y - b.h, b.w, b.h);
-      // windows
       ctx.fillStyle = '#f0c674';
       for (let wy = GROUND_Y - b.h + 4; wy < GROUND_Y - 4; wy += 6) {
         for (let wx = b.x + 2; wx < b.x + b.w - 2; wx += 5) {
-          if (Math.random() < 0.3) ctx.fillRect(wx, wy, 2, 2);
+          if (b.seed > 0.6 && Math.random() < 0.35) ctx.fillRect(wx, wy, 2, 2);
         }
       }
     }
@@ -448,34 +515,213 @@
     ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
     ctx.fillStyle = '#3a2a2a';
     ctx.fillRect(0, GROUND_Y, W, 2);
-    // ground tiles
     ctx.fillStyle = '#1a0a0a';
-    for (let x = 0; x < W; x += 8) {
-      ctx.fillRect(x, GROUND_Y + 4, 1, H - GROUND_Y - 4);
-    }
-    for (let y = GROUND_Y + 6; y < H; y += 6) {
-      ctx.fillRect(0, y, W, 1);
+    for (let x = 0; x < W; x += 8) ctx.fillRect(x, GROUND_Y + 4, 1, H - GROUND_Y - 4);
+    for (let y = GROUND_Y + 6; y < H; y += 6) ctx.fillRect(0, y, W, 1);
+  }
+
+  // ================================================================
+  // FX LAYER — shake, hitstop, flash, damage numbers, particles
+  // ================================================================
+  const FX = {
+    shakeAmp: 0,     // pixels
+    shakeDecay: 0.82,
+    hitstop: 0,      // frames to freeze
+    timeScale: 1,    // 1 = normal, <1 = slow-mo (unused in favor of hitstop)
+    flashTimer: 0,   // frames of white flash
+    redTimer: 0,     // frames of red tint
+    particles: [],
+    damageNumbers: [],
+  };
+
+  function triggerShake(amp) { FX.shakeAmp = Math.max(FX.shakeAmp, amp); }
+  function triggerHitstop(frames) { FX.hitstop = Math.max(FX.hitstop, frames); }
+  function triggerFlash(ms) {
+    FX.flashTimer = ms;
+    const el = document.getElementById('flash-overlay');
+    el.style.opacity = '0.85';
+    clearTimeout(triggerFlash._t);
+    triggerFlash._t = setTimeout(() => { el.style.opacity = '0'; }, ms);
+  }
+  function triggerRed(ms, alpha = 0.6) {
+    FX.redTimer = ms;
+    const el = document.getElementById('red-overlay');
+    el.style.opacity = alpha;
+    clearTimeout(triggerRed._t);
+    triggerRed._t = setTimeout(() => { el.style.opacity = '0'; }, ms);
+  }
+
+  // --- particles with typed behavior ---
+  function spawnHitSparks(x, y, dir) {
+    const colors = ['#ffffff', '#ffe88a', '#ff9e5e', '#ff4d6d'];
+    for (let i = 0; i < 14; i++) {
+      const spread = 0.9;
+      const vx = dir * (1 + Math.random() * 3) * (Math.random() * spread + 0.5);
+      const vy = -1 - Math.random() * 3;
+      FX.particles.push({
+        x, y, vx, vy,
+        size: Math.random() < 0.3 ? 2 : 1,
+        life: 18 + Math.floor(Math.random() * 12),
+        maxLife: 30,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        type: 'spark'
+      });
     }
   }
 
-  // ---------- GAME STATE ----------
+  function spawnBlockSparks(x, y, dir) {
+    // bright cyan shield sparks
+    for (let i = 0; i < 10; i++) {
+      FX.particles.push({
+        x, y,
+        vx: dir * (Math.random() * 3 + 1),
+        vy: (Math.random() - 0.5) * 2,
+        size: 2, life: 16, maxLife: 16,
+        color: '#8feaff', type: 'spark'
+      });
+    }
+  }
+
+  function spawnDust(x) {
+    for (let i = 0; i < 6; i++) {
+      FX.particles.push({
+        x, y: GROUND_Y - 2,
+        vx: (Math.random() - 0.5) * 3,
+        vy: -Math.random() * 1.5,
+        size: 2, life: 20, maxLife: 20,
+        color: '#5a4030', type: 'dust'
+      });
+    }
+  }
+
+  function spawnVictory(x, y) {
+    const colors = ['#ffd866', '#ff8fa3', '#8fbeff', '#ffffff', '#5bc0eb'];
+    for (let i = 0; i < 40; i++) {
+      FX.particles.push({
+        x, y,
+        vx: (Math.random() - 0.5) * 6,
+        vy: -2 - Math.random() * 4,
+        size: Math.random() < 0.5 ? 2 : 1,
+        life: 40 + Math.floor(Math.random() * 30),
+        maxLife: 70,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        type: 'victory'
+      });
+    }
+  }
+
+  function spawnDamageNumber(x, y, value, defended) {
+    FX.damageNumbers.push({
+      x, y, value, defended,
+      vy: -CFG.damageNumberRise,
+      life: CFG.damageNumberLife,
+      maxLife: CFG.damageNumberLife
+    });
+  }
+
+  function updateFX() {
+    // shake decays exponentially
+    FX.shakeAmp *= FX.shakeDecay;
+    if (FX.shakeAmp < 0.05) FX.shakeAmp = 0;
+
+    // particles
+    for (let i = FX.particles.length - 1; i >= 0; i--) {
+      const p = FX.particles[i];
+      p.x += p.vx; p.y += p.vy;
+      p.vy += p.type === 'victory' ? 0.05 : 0.18;
+      if (p.type === 'dust') p.vy += 0.08;
+      p.vx *= 0.97;
+      p.life--;
+      if (p.life <= 0) FX.particles.splice(i, 1);
+    }
+
+    // damage numbers
+    for (let i = FX.damageNumbers.length - 1; i >= 0; i--) {
+      const d = FX.damageNumbers[i];
+      d.y += d.vy;
+      d.vy *= 0.92;
+      d.life--;
+      if (d.life <= 0) FX.damageNumbers.splice(i, 1);
+    }
+  }
+
+  function drawParticles() {
+    for (const p of FX.particles) {
+      const alpha = Math.max(0, p.life / p.maxLife);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = p.color;
+      ctx.fillRect(Math.floor(p.x), Math.floor(p.y), p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDamageNumbers() {
+    ctx.font = 'bold 10px "Press Start 2P", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const d of FX.damageNumbers) {
+      const alpha = Math.max(0, d.life / d.maxLife);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = d.defended ? '#8feaff' : '#ffec8a';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 3;
+      ctx.strokeText(String(d.value), Math.floor(d.x), Math.floor(d.y));
+      ctx.fillText(String(d.value), Math.floor(d.x), Math.floor(d.y));
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ================================================================
+  // GAME STATE
+  // ================================================================
   const keys = {};
+  const pressed = {}; // edge-trigger this frame
+
   window.addEventListener('keydown', e => {
-    keys[e.key.toLowerCase()] = true;
+    const k = e.key.toLowerCase();
+    if (!keys[k]) pressed[k] = true;
+    keys[k] = true;
     if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+
+    // init audio on first user gesture
+    if (!Audio.init()) { /* try once, will retry */ }
+    Audio.resume();
+
     if (e.code === 'Space' && (state.phase === 'result' || state.phase === 'ready')) {
       resetRound();
       state.phase = 'fight';
       hideBanner();
+      Audio.sfx.roundStart();
+    }
+    if (k === 'm' || k === ',') {
+      const newSfx = !Audio.isSFXMuted(); Audio.setSFXMuted(newSfx);
+      document.getElementById('chip-sfx').classList.toggle('on', !newSfx);
+    }
+    if (k === 'b' || k === '.') {
+      const newBgm = !Audio.isBGMMuted(); Audio.setBGMMuted(newBgm);
+      document.getElementById('chip-bgm').classList.toggle('on', !newBgm);
     }
   });
   window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+  // chips also toggle
+  document.getElementById('chip-sfx').addEventListener('click', () => {
+    Audio.init(); const newSfx = !Audio.isSFXMuted(); Audio.setSFXMuted(newSfx);
+    document.getElementById('chip-sfx').classList.toggle('on', !newSfx);
+  });
+  document.getElementById('chip-bgm').addEventListener('click', () => {
+    Audio.init(); const newBgm = !Audio.isBGMMuted(); Audio.setBGMMuted(newBgm);
+    document.getElementById('chip-bgm').classList.toggle('on', !newBgm);
+  });
+  document.querySelector('h1').addEventListener('click', () => {
+    Audio.init();
+  });
 
   const state = {
     phase: 'ready', // ready | fight | result
     round: 1,
     p1: null,
-    p2: null
+    p2: null,
   };
 
   function createMecha(palette, x, facing, controls) {
@@ -486,16 +732,21 @@
       w: 24, h: 32,
       facing,
       hp: 100,
+      maxHp: 100,
       controls,
       onGround: true,
-      state: 'idle', // idle | walk | attack | defend | hit | jump
+      coyote: 0,            // frames of coyote time after walking off ledge
+      attackTimer: 0,        // counts down through windup→active→recover; 0 = idle
+      attackPhase: 'none',  // windup | active | recover | none
+      attackHit: false,     // did this attack already register a hit?
+      attackDir: facing,    // locked facing during attack
+      hitCooldown: 0,       // hitstun / flash frames
+      invincible: 0,
+      state: 'idle',        // idle|walk|jump|attack|defend|hit
       animFrame: 0,
       animTimer: 0,
-      attackCooldown: 0,
-      hitCooldown: 0,
-      invincible: 0,
       flash: false,
-      attackHit: false
+      landingQueued: false, // for land-dust & land-sound
     };
   }
 
@@ -506,64 +757,105 @@
     state.p2 = createMecha('p2', W - 50 - 24, 'left', {
       left: 'arrowleft', right: 'arrowright', jump: 'arrowup', attack: 'j', defend: 'k'
     });
+    FX.particles = []; FX.damageNumbers = []; FX.shakeAmp = 0; FX.hitstop = 0;
     state.phase = 'ready';
     updateHUD();
-    showBanner('ROUND ' + state.round, 'FIGHT! 按 SPACE 继续', 1500);
+    showBanner('ROUND ' + state.round, 'FIGHT! 按 SPACE 开始', 1400);
     setTimeout(() => {
-      if (state.phase === 'ready') {
-        state.phase = 'fight';
-        hideBanner();
-      }
-    }, 1500);
+      if (state.phase === 'ready') { state.phase = 'fight'; hideBanner(); }
+    }, 1400);
   }
 
   function showBanner(text, sub = '', duration = 0) {
     const b = document.getElementById('banner');
     b.innerHTML = text + (sub ? `<span class="sub">${sub}</span>` : '');
+    b.classList.remove('show');
+    // force reflow so scale-from-animation restarts
+    void b.offsetWidth;
     b.classList.add('show');
-    if (duration > 0) {
-      setTimeout(() => b.classList.remove('show'), duration);
-    }
+    if (duration > 0) setTimeout(() => b.classList.remove('show'), duration);
   }
-  function hideBanner() {
-    document.getElementById('banner').classList.remove('show');
-  }
+  function hideBanner() { document.getElementById('banner').classList.remove('show'); }
 
   function updateHUD() {
-    document.getElementById('hp-p1').style.width = Math.max(0, state.p1.hp) + '%';
-    document.getElementById('hp-p2').style.width = Math.max(0, state.p2.hp) + '%';
+    const hp1 = Math.max(0, state.p1.hp);
+    const hp2 = Math.max(0, state.p2.hp);
+    const bar1 = document.getElementById('hp-p1');
+    const bar2 = document.getElementById('hp-p2');
+    bar1.style.width = hp1 + '%';
+    bar2.style.width = hp2 + '%';
+    bar1.classList.toggle('low', hp1 < 25);
+    bar2.classList.toggle('low', hp2 < 25);
   }
 
-  // ---------- GAME LOGIC ----------
+  // ================================================================
+  // GAME LOGIC
+  // ================================================================
   function processInput(m) {
     const c = m.controls;
     let moving = false;
+    const leftHeld = keys[c.left];
+    const rightHeld = keys[c.right];
+    const inAttack = m.attackTimer > 0;
+    const inHitstun = m.hitCooldown > 0;
 
-    if (keys[c.left]) { m.vx = -1.6; m.facing = 'left'; moving = true; }
-    else if (keys[c.right]) { m.vx = 1.6; m.facing = 'right'; moving = true; }
-    else { m.vx = 0; }
+    // During attack/hitstun, input is partially restricted (attack locks facing)
+    const canControl = !inHitstun;
+    const canMove = canControl && m.attackPhase !== 'active' && m.attackPhase !== 'windup';
+    const canAttack = canControl && !inAttack && m.onGround;
 
-    m.defending = !!keys[c.defend] && m.onGround && m.attackCooldown === 0;
-
-    if (keys[c.jump] && m.onGround) {
-      m.vy = -9.2;
-      m.onGround = false;
+    if (canControl) {
+      if (leftHeld) { m.vx = -1.8; if (m.attackTimer === 0) m.facing = 'left'; moving = true; }
+      else if (rightHeld) { m.vx = 1.8; if (m.attackTimer === 0) m.facing = 'right'; moving = true; }
+      else { m.vx = 0; }
+    } else {
+      m.vx *= 0.6; // still drift a bit during hitstun
     }
 
-    if (keys[c.attack] && m.attackCooldown === 0 && !m.defending) {
-      m.state = 'attack';
-      m.animTimer = 0;
-      m.animFrame = 0;
-      m.attackCooldown = 45;
+    // attack input (edge-trigger)
+    if (canAttack && pressed[c.attack]) {
+      m.attackTimer = CFG.attackWindup + CFG.attackActive + CFG.attackRecover;
+      m.attackPhase = 'windup';
       m.attackHit = false;
+      m.attackDir = m.facing;
+      Audio.sfx.swing();
+      // stop moving during attack
+      m.vx = 0;
     }
 
+    // defense — can hold to block, interrupted by attack
+    m.defending = !!keys[c.defend] && m.onGround && m.attackTimer === 0 && !inHitstun;
+
+    // jump with coyote time
+    if (canControl && pressed[c.jump] && m.coyote > 0) {
+      m.vy = -9.4;
+      m.onGround = false;
+      m.coyote = 0;
+      Audio.sfx.jump();
+    }
+
+    // Update facing during attack from locked direction
+    if (inAttack) m.facing = m.attackDir;
+
+    // Determine state label
     if (!m.onGround) m.state = 'jump';
-    else if (m.state === 'attack') { /* let animation finish */ }
+    else if (m.attackTimer > 0) m.state = 'attack';
     else if (m.hitCooldown > 0) m.state = 'hit';
     else if (m.defending) m.state = 'defend';
-    else if (moving) m.state = 'walk';
+    else if (moving && canMove) m.state = 'walk';
     else m.state = 'idle';
+
+    // Advance attack timer
+    if (m.attackTimer > 0) {
+      m.attackTimer--;
+      const remaining = m.attackTimer;
+      const windupEnd = CFG.attackActive + CFG.attackRecover;
+      const activeEnd = CFG.attackRecover;
+      if (remaining > windupEnd) m.attackPhase = 'windup';
+      else if (remaining > activeEnd) m.attackPhase = 'active';
+      else if (remaining > 0) m.attackPhase = 'recover';
+      else m.attackPhase = 'none';
+    }
   }
 
   function updatePhysics(m) {
@@ -571,109 +863,123 @@
     m.x += m.vx;
     m.y += m.vy;
 
-    // clamp to ground
     if (m.y + m.h >= GROUND_Y) {
+      // landing event: spawn dust + play sound (only when falling fast enough)
+      const falling = m.vy;
       m.y = GROUND_Y - m.h;
+      const wasAir = !m.onGround;
       m.vy = 0;
       m.onGround = true;
+      m.coyote = 6;
+      if (wasAir && falling > 3) {
+        m.landingQueued = true;
+      }
+    } else {
+      if (m.onGround) m.coyote = 6;
+      m.onGround = false;
+      else m.coyote--;
     }
 
-    // clamp to screen
+    // clamp
     if (m.x < 4) m.x = 4;
     if (m.x + m.w > W - 4) m.x = W - 4 - m.w;
   }
 
   function updateAnimation(m) {
     m.animTimer++;
-    if (m.animTimer >= 6) {
-      m.animTimer = 0;
-      m.animFrame = (m.animFrame + 1) % 2;
-    }
-    if (m.attackCooldown > 0) m.attackCooldown--;
+    if (m.animTimer >= 6) { m.animTimer = 0; m.animFrame = (m.animFrame + 1) % 2; }
     if (m.hitCooldown > 0) m.hitCooldown--;
     if (m.invincible > 0) m.invincible--;
-    m.flash = m.hitCooldown > 0 && m.hitCooldown % 4 < 2;
+    m.flash = m.hitCooldown > 0 && m.hitCooldown % 3 < 2;
+
+    // play landing effects
+    if (m.landingQueued) {
+      m.landingQueued = false;
+      spawnDust(m.x + m.w / 2);
+      Audio.sfx.land();
+    }
+  }
+
+  // central hit resolver — applies damage, spawns FX, plays SFX
+  function applyHit(attacker, defender, isKO) {
+    const defending = defender.defending;
+    let dmg = 15 + Math.floor(Math.random() * 11);
+    if (defending) dmg = Math.max(2, Math.floor(dmg * 0.25));
+
+    defender.hp -= dmg;
+    defender.invincible = 18;
+    defender.hitCooldown = defending ? 12 : 22;
+    defender.state = 'hit';
+    const kb = defending ? 1.5 : (isKO ? 6 : 4.2);
+    defender.vx = (attacker.attackDir === 'right' ? kb : -kb);
+    defender.vy = defending ? -1.8 : -3.6;
+    defender.onGround = false;
+
+    const hitX = (attacker.x + attacker.w / 2 + defender.x + defender.w / 2) / 2;
+    const hitY = defender.y + 14;
+
+    // FX
+    if (defending) {
+      spawnBlockSparks(hitX, hitY, attacker.attackDir === 'right' ? 1 : -1);
+      triggerShake(CFG.shakeBlock);
+      triggerHitstop(CFG.hitstopBlock);
+      Audio.sfx.hitDefend();
+    } else {
+      spawnHitSparks(hitX, hitY, attacker.attackDir === 'right' ? 1 : -1);
+      if (isKO) {
+        triggerShake(CFG.shakeHeavy);
+        triggerHitstop(CFG.hitstopHeavy);
+        triggerFlash(140);
+        triggerRed(240, 0.55);
+        Audio.sfx.ko();
+      } else {
+        triggerShake(CFG.shakeNormal);
+        triggerHitstop(CFG.hitstopNormal);
+        triggerFlash(60);
+        Audio.sfx.hitNormal();
+      }
+    }
+
+    spawnDamageNumber(hitX, hitY - 8, dmg, defending);
+
+    updateHUD();
+
+    if (defender.hp <= 0) {
+      const winner = attacker === state.p1 ? 'p1' : 'p2';
+      state.phase = 'result';
+      state.round++;
+      const name = winner === 'p1' ? 'P1 红方' : 'P2 蓝方';
+      spawnVictory(W / 2, GROUND_Y - 60);
+      setTimeout(() => {
+        showBanner(name + ' 胜利!', '按 SPACE 再来一局', 0);
+      }, 700);
+    }
   }
 
   function resolveAttacker(attacker, defender) {
-    // attack hitbox check during certain frames
-    if (attacker.state !== 'attack') return;
+    if (attacker.attackPhase !== 'active' || attacker.attackHit) return;
+    if (defender.invincible > 0) return;
 
-    // attack active when animTimer in middle of animation
-    const active = attacker.attackCooldown > 20 && attacker.attackCooldown < 40;
-    if (!active || attacker.attackHit) return;
-
-    // hitbox in front of attacker
-    const reachX = attacker.facing === 'right'
+    const reachX = attacker.attackDir === 'right'
       ? attacker.x + attacker.w - 2
       : attacker.x - 10;
-    const reachW = 12;
+    const reachW = 14;
 
     const ax1 = reachX, ax2 = reachX + reachW;
     const dx1 = defender.x, dx2 = defender.x + defender.w;
     const overlap = ax2 > dx1 && ax1 < dx2;
     const yOverlap = attacker.y + 4 < defender.y + defender.h && attacker.y + attacker.h > defender.y + 4;
 
-    if (overlap && yOverlap && defender.invincible === 0) {
-      let dmg = 15 + Math.floor(Math.random() * 11); // 15-25
-      if (defender.defending) {
-        dmg = Math.max(2, Math.floor(dmg * 0.3));
-      }
-      defender.hp -= dmg;
-      defender.invincible = 20;
-      defender.hitCooldown = 25;
-      defender.state = 'hit';
-      // knockback
-      const kb = defender.defending ? 1.5 : 4;
-      defender.vx = attacker.facing === 'right' ? kb : -kb;
-      defender.vy = -2.5;
-      defender.onGround = false;
+    if (overlap && yOverlap) {
       attacker.attackHit = true;
-      updateHUD();
-
-      if (defender.hp <= 0) {
-        endGame(attacker === state.p1 ? 'p1' : 'p2');
-      }
+      const isKO = defender.hp - (15 + 11) <= 0; // approximate
+      applyHit(attacker, defender, false);
     }
   }
 
-  function endGame(winner) {
-    state.phase = 'result';
-    state.round++;
-    const name = winner === 'p1' ? 'P1 红方' : 'P2 蓝方';
-    showBanner(name + ' 胜利!', '按 SPACE 再来一局', 0);
-  }
-
-  // ---------- PARTICLES (hit sparks) ----------
-  const sparks = [];
-  function spawnSparks(x, y, color) {
-    for (let i = 0; i < 6; i++) {
-      sparks.push({
-        x, y,
-        vx: (Math.random() - 0.5) * 3,
-        vy: (Math.random() - 0.5) * 3 - 1,
-        life: 20,
-        color
-      });
-    }
-  }
-  function updateSparks() {
-    for (let i = sparks.length - 1; i >= 0; i--) {
-      const s = sparks[i];
-      s.x += s.vx; s.y += s.vy;
-      s.vy += 0.2;
-      s.life--;
-      if (s.life <= 0) sparks.splice(i, 1);
-    }
-  }
-  function drawSparks() {
-    for (const s of sparks) {
-      ctx.fillStyle = s.color;
-      ctx.fillRect(Math.floor(s.x), Math.floor(s.y), 2, 2);
-    }
-  }
-
-  // ---------- GAME LOOP ----------
+  // ================================================================
+  // GAME LOOP with hitstop
+  // ================================================================
   function getSpriteName(m) {
     if (m.state === 'attack') return 'attack';
     if (m.state === 'defend') return 'defend';
@@ -684,10 +990,26 @@
   }
 
   function tick() {
-    // scale canvas rendering via CSS — we render at 320x180 and let CSS scale
-    ctx.save();
-    drawBackground();
+    // hitstop: freeze gameplay but keep FX (shake decay) going
+    if (FX.hitstop > 0) {
+      FX.hitstop--;
+      // still decay shake & fx
+      updateFX();
+      // clear pressed so held attacks don't double-fire
+      for (const k in pressed) pressed[k] = false;
 
+      // even during hitstop, render once with shake
+      const sx = (Math.random() - 0.5) * FX.shakeAmp;
+      const sy = (Math.random() - 0.5) * FX.shakeAmp;
+      ctx.save();
+      ctx.translate(sx, sy);
+      render();
+      ctx.restore();
+      requestAnimationFrame(tick);
+      return;
+    }
+
+    // input / physics / logic
     if (state.phase === 'fight') {
       [state.p1, state.p2].forEach(m => {
         processInput(m);
@@ -696,45 +1018,99 @@
       });
       resolveAttacker(state.p1, state.p2);
       resolveAttacker(state.p2, state.p1);
-      updateSparks();
-    } else if (state.phase === 'ready' || state.phase === 'result') {
-      // Just animate idle mechas
+    } else {
       if (state.p1 && state.p2) {
-        [state.p1, state.p2].forEach(m => updateAnimation(m));
+        [state.p1, state.p2].forEach(m => {
+          m.animTimer++;
+          if (m.animTimer >= 6) { m.animTimer = 0; m.animFrame = (m.animFrame + 1) % 2; }
+        });
       }
     }
 
-    // Draw mechas (and sparks on hit)
-    if (state.p1 && state.p2) {
-      for (const m of [state.p1, state.p2]) {
-        const spriteName = getSpriteName(m);
-        // slight shadow
-        ctx.fillStyle = 'rgba(0,0,0,0.4)';
-        ctx.beginPath();
-        ctx.ellipse(m.x + m.w / 2, GROUND_Y + 1, m.w / 2, 2, 0, 0, Math.PI * 2);
-        ctx.fill();
-        drawSprite(spriteName, m.x, m.y, m.facing, m.palette, m.flash);
-      }
-      drawSparks();
-    }
+    updateFX();
 
+    // consume edge-press flags
+    for (const k in pressed) pressed[k] = false;
+
+    // render with shake
+    const sx = (Math.random() - 0.5) * FX.shakeAmp;
+    const sy = (Math.random() - 0.5) * FX.shakeAmp;
+    ctx.save();
+    ctx.translate(sx, sy);
+    render();
     ctx.restore();
 
     requestAnimationFrame(tick);
   }
 
-  // Set canvas scale via JS (match CSS)
+  function render() {
+    drawBackground();
+
+    if (!state.p1 || !state.p2) return;
+
+    // shadows first
+    for (const m of [state.p1, state.p2]) {
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.beginPath();
+      ctx.ellipse(m.x + m.w / 2, GROUND_Y + 1, m.w / 2, 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // mechas — sort by y (p2 usually right side draws fine either way)
+    const list = [state.p1, state.p2].sort((a, b) => (a.y + a.h) - (b.y + b.h));
+    for (const m of list) {
+      const spriteName = getSpriteName(m);
+      // visual lean when hurt — shift sprite slightly
+      const leanX = m.state === 'hit' ? (m.facing === 'right' ? -1 : 1) : 0;
+      const leanY = m.state === 'hit' ? 1 : 0;
+      drawSprite(spriteName, m.x + leanX, m.y + leanY, m.facing, m.palette, m.flash);
+
+      // shield aura when defending
+      if (m.defending) {
+        ctx.globalAlpha = 0.55;
+        ctx.strokeStyle = '#8feaff';
+        ctx.lineWidth = 1;
+        // a rough shield glow around the mecha
+        const sx = m.facing === 'right' ? m.x + m.w - 2 : m.x - 6;
+        ctx.strokeRect(sx - 1, m.y + 2, 8, m.h - 4);
+        ctx.globalAlpha = 1;
+      }
+
+      // attack slash arc during active phase
+      if (m.state === 'attack' && m.attackPhase === 'active') {
+        const cx = m.facing === 'right' ? m.x + m.w + 4 : m.x - 4;
+        const cy = m.y + 18;
+        ctx.globalAlpha = 0.55;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 10, m.facing === 'right' ? -Math.PI / 2 : Math.PI / 2,
+                  m.facing === 'right' ? Math.PI / 2 : -Math.PI / 2,
+                  m.facing !== 'right');
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    drawParticles();
+    drawDamageNumbers();
+  }
+
+  // ================================================================
+  // BOOT
+  // ================================================================
   function resize() {
-    const scale = SCALE;
-    canvas.style.width = (W * scale) + 'px';
-    canvas.style.height = (H * scale) + 'px';
+    canvas.style.width = (W * SCALE) + 'px';
+    canvas.style.height = (H * SCALE) + 'px';
   }
   resize();
   window.addEventListener('resize', resize);
 
-  // Start
   resetRound();
   tick();
+
+  // Try to init audio eagerly (browsers often autoplay sounds on page load if they trust)
+  Audio.init();
 })();
 </script>
 </body>
