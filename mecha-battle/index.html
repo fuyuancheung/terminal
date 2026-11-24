@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MECHA CLASH · 像素机甲对战</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    background: #0a0a14;
+    color: #eaeaea;
+    font-family: 'Press Start 2P', 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.03) 0, rgba(255,255,255,0.03) 1px, transparent 1px, transparent 3px);
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  h1 {
+    font-size: 14px;
+    letter-spacing: 2px;
+    color: #ffd866;
+    text-shadow: 0 0 8px rgba(255,216,102,0.5);
+    margin-bottom: 12px;
+  }
+
+  #game-shell {
+    position: relative;
+    border: 3px solid #3a3a5c;
+    box-shadow:
+      0 0 0 3px #0a0a14,
+      0 0 30px rgba(120, 80, 255, 0.25);
+    background: #000;
+    image-rendering: pixelated;
+  }
+
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+
+  .hud {
+    position: absolute;
+    top: 8px; left: 8px; right: 8px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 8px;
+    pointer-events: none;
+    z-index: 5;
+  }
+
+  .hud-side { display: flex; align-items: center; gap: 6px; }
+  .hud-label { width: 28px; }
+  .hp-bar {
+    width: 140px; height: 12px;
+    background: #1a1a2e;
+    border: 2px solid #3a3a5c;
+    position: relative;
+    overflow: hidden;
+  }
+  .hp-fill {
+    height: 100%;
+    transition: width 0.2s ease-out;
+  }
+  .hp-fill.p1 { background: linear-gradient(90deg, #ff4d6d, #ff8fa3); }
+  .hp-fill.p2 { background: linear-gradient(90deg, #4d9fff, #8fbeff); }
+
+  .center-banner {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 18px;
+    color: #ffd866;
+    text-shadow: 2px 2px 0 #000, 0 0 16px rgba(255,216,102,0.6);
+    text-align: center;
+    z-index: 6;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .center-banner.show { opacity: 1; }
+  .center-banner .sub {
+    display: block;
+    font-size: 8px;
+    margin-top: 10px;
+    color: #eaeaea;
+    opacity: 0.8;
+  }
+
+  .controls-hint {
+    margin-top: 14px;
+    font-size: 7px;
+    color: #6a6a8a;
+    text-align: center;
+    line-height: 1.8;
+  }
+  .controls-hint span.p1 { color: #ff8fa3; }
+  .controls-hint span.p2 { color: #8fbeff; }
+
+  .tag {
+    position: absolute;
+    bottom: -22px;
+    font-size: 6px;
+    color: #4a4a6a;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+
+<h1>MECHA CLASH</h1>
+
+<div id="game-shell">
+  <canvas id="game" width="320" height="180"></canvas>
+
+  <div class="hud">
+    <div class="hud-side">
+      <span class="hud-label" style="color:#ff8fa3">P1</span>
+      <div class="hp-bar"><div id="hp-p1" class="hp-fill p1" style="width:100%"></div></div>
+    </div>
+    <div class="hud-side" style="justify-content:flex-end">
+      <div class="hp-bar"><div id="hp-p2" class="hp-fill p2" style="width:100%"></div></div>
+      <span class="hud-label" style="color:#8fbeff">P2</span>
+    </div>
+  </div>
+
+  <div id="banner" class="center-banner"></div>
+</div>
+
+<div class="controls-hint">
+  <span class="p1">P1</span> A/D 移动 · W 跳跃 · F 攻击 · G 防御 &nbsp;|&nbsp;
+  <span class="p2">P2</span> ←/→ 移动 · ↑ 跳跃 · J 攻击 · K 防御
+  <br>按 <span style="color:#ffd866">SPACE</span> 开始 / 重开
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  const W = canvas.width;   // 320
+  const H = canvas.height;  // 180
+  const GROUND_Y = 150;
+  const GRAVITY = 0.55;
+  const SCALE = 2.5;
+
+  // ---------- PIXEL ART: MECHA SPRITES ----------
+  // Each frame is a 24x32 grid drawn with color codes
+  // ' ' = transparent
+  // Palette:
+  //  P1 (red): a=darkred b=red c=orange d=yellow e=dark
+  //  P2 (blue): a=darkblue b=blue c=cyan d=light e=dark
+
+  const PALETTES = {
+    p1: { 'a':'#7a1a28', 'b':'#e63946', 'c':'#ff7b54', 'd':'#ffd166', 'e':'#1a0a0e', 's':'#c0c0c0', 'g':'#4a4a4a' },
+    p2: { 'a':'#142850', 'b':'#2b78e4', 'c':'#5bc0eb', 'd':'#a8dadc', 'e':'#0a1428', 's':'#c0c0c0', 'g':'#4a4a4a' }
+  };
+
+  // 24 wide x 32 tall, facing RIGHT. Flip for left.
+  // IDLE frame (both mechas share structure, colors applied per palette)
+  const SPRITES = {
+    idle: [
+      "      eeee             ",
+      "     ebbbbe            ",
+      "     ebcbbe            ",
+      "     ebccbe   ss       ",
+      "     ebcbbe   ss       ",
+      "      ebbbe            ",
+      "    eeeeeee            ",
+      "   eabbbbbae           ",
+      "   eabcccbae   ssss    ",
+      "   eabbdccae  sdddds   ",
+      "   eabcccae  sddddd s  ",
+      "   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ",
+      "    eeeee    ssss s    ",
+      "     aaaa    ss  s     ",
+      "     aaaa    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ",
+      "    ea  ae  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+    ],
+
+    // walk frame (legs offset)
+    walk1: [
+      "      eeee             ",
+      "     ebbbbe            ",
+      "     ebcbbe            ",
+      "     ebccbe   ss       ",
+      "     ebcbbe   ss       ",
+      "      ebbbe            ",
+      "    eeeeeee            ",
+      "   eabbbbbae           ",
+      "   eabcccbae   ssss    ",
+      "   eabbdccae  sdddds   ",
+      "   eabcccae  sddddd s  ",
+      "   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ",
+      "    eeeee    ssss s    ",
+      "     aaaa    ss  s     ",
+      "     aaaa    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     aaaa    gggg      ",
+      "    ea  ae   gg gg     ",
+      "   ea    ae  gg gg     ",
+      "   eb    be  gg gg     ",
+      "   eb    be  gg  gg    ",
+      "   eb    be  gg  gg    ",
+      "  eeb    bee gg  gg    ",
+      "  eeb    bee gg  gg    ",
+      "  ee      ee gg  gg    ",
+      "  ee      ee gg  gg    ",
+      "  e        e  ee ee    ",
+      "  e        e  ee ee    ",
+      "  e        e  ee ee    ",
+    ],
+
+    walk2: [
+      "      eeee             ",
+      "     ebbbbe            ",
+      "     ebcbbe            ",
+      "     ebccbe   ss       ",
+      "     ebcbbe   ss       ",
+      "      ebbbe            ",
+      "    eeeeeee            ",
+      "   eabbbbbae           ",
+      "   eabcccbae   ssss    ",
+      "   eabbdccae  sdddds   ",
+      "   eabcccae  sddddd s  ",
+      "   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ",
+      "    eeeee    ssss s    ",
+      "     aaaa    ss  s     ",
+      "     aaaa    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ",
+      "    ea  ae  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+    ],
+
+    // attack frame - sword extended forward
+    attack: [
+      "      eeee         ss  ",
+      "     ebbbbe        sss ",
+      "     ebcbbe       sss  ",
+      "     ebccbe       ss   ",
+      "     ebcbbe            ",
+      "      ebbbe            ",
+      "    eeeeeee            ",
+      "   eabbbbbae           ",
+      "   eabcccbae   ssss    ",
+      "   eabbdccae  sdddds   ",
+      "   eabcccae  sddddd s  ",
+      "   eabbbbae  sddddd s  ",
+      "   eaaaaae   sdddd s   ",
+      "    eeeee    ssss s    ",
+      "     aaaa    ss  s     ",
+      "     aaaa    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     abba    ss  s     ",
+      "     aaaa    gggg      ",
+      "    ea  ae  gg  gg     ",
+      "    ea  ae  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "    eb  be  gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+    ],
+
+    // defend frame - shield up
+    defend: [
+      "      eeee            g",
+      "     ebbbbe           gg",
+      "     ebcbbe          ggg",
+      "     ebccbe    ss    ggg",
+      "     ebcbbe    ss   gggg",
+      "      ebbbe        gggg",
+      "    eeeeeee       ggggg",
+      "   eabbbbbae      ggggg",
+      "   eabcccbae  ssssggggg",
+      "   eabbdccae sddddggggg",
+      "   eabcccae sddddd gggg",
+      "   eabbbbae sddddd gggg",
+      "   eaaaaae  sdddd  gggg",
+      "    eeeee   ssss   ggg ",
+      "     aaaa   ss  s   gg ",
+      "     aaaa   ss  s   gg ",
+      "     abba   ss  s   g  ",
+      "     abba   ss  s      ",
+      "     abba   ss  s      ",
+      "     aaaa   gggg       ",
+      "    ea  ae gg  gg      ",
+      "    ea  ae gg  gg      ",
+      "    eb  be gg  gg      ",
+      "    eb  be gg  gg      ",
+      "    eb  be gg  gg      ",
+      "   eeb  bee gg  gg     ",
+      "   eeb  bee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   ee    ee gg  gg     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+      "   e      e  ee ee     ",
+    ]
+  };
+
+  function drawSprite(spriteName, x, y, facing, paletteKey, flash=false) {
+    const sprite = SPRITES[spriteName];
+    if (!sprite) return;
+    const pal = PALETTES[paletteKey];
+    const flip = facing === 'left';
+    ctx.save();
+    if (flip) {
+      ctx.translate(x + sprite[0].length, y);
+      ctx.scale(-1, 1);
+    } else {
+      ctx.translate(x, y);
+    }
+    for (let row = 0; row < sprite.length; row++) {
+      const line = sprite[row];
+      for (let col = 0; col < line.length; col++) {
+        const ch = line[col];
+        if (ch === ' ') continue;
+        let color = pal[ch] || '#fff';
+        if (flash && ch !== 'e') color = '#fff';
+        ctx.fillStyle = color;
+        ctx.fillRect(col, row, 1, 1);
+      }
+    }
+    ctx.restore();
+  }
+
+  // ---------- BACKGROUND ----------
+  const stars = [];
+  for (let i = 0; i < 60; i++) {
+    stars.push({
+      x: Math.random() * W,
+      y: Math.random() * (GROUND_Y - 30),
+      b: Math.random()
+    });
+  }
+
+  // city buildings silhouette
+  const buildings = [];
+  (() => {
+    let x = 0;
+    while (x < W) {
+      const bw = 10 + Math.floor(Math.random() * 18);
+      const bh = 20 + Math.floor(Math.random() * 50);
+      buildings.push({ x, w: bw, h: bh });
+      x += bw + 1;
+    }
+  })();
+
+  function drawBackground() {
+    // sky gradient (dithered)
+    for (let y = 0; y < GROUND_Y; y++) {
+      const ratio = y / GROUND_Y;
+      const r = Math.floor(20 + 40 * ratio);
+      const g = Math.floor(10 + 20 * ratio);
+      const b = Math.floor(40 + 60 * ratio);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(0, y, W, 1);
+    }
+
+    // moon
+    ctx.fillStyle = '#f0c674';
+    ctx.beginPath();
+    ctx.arc(260, 40, 14, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#0a0a14';
+    ctx.beginPath();
+    ctx.arc(255, 36, 13, 0, Math.PI * 2);
+    ctx.fill();
+
+    // stars
+    for (const s of stars) {
+      const flick = 0.5 + 0.5 * Math.sin(Date.now() * 0.003 + s.x);
+      ctx.fillStyle = `rgba(255,255,255,${s.b * flick})`;
+      ctx.fillRect(Math.floor(s.x), Math.floor(s.y), 1, 1);
+    }
+
+    // distant buildings
+    for (const b of buildings) {
+      ctx.fillStyle = '#1a1a2e';
+      ctx.fillRect(b.x, GROUND_Y - b.h, b.w, b.h);
+      // windows
+      ctx.fillStyle = '#f0c674';
+      for (let wy = GROUND_Y - b.h + 4; wy < GROUND_Y - 4; wy += 6) {
+        for (let wx = b.x + 2; wx < b.x + b.w - 2; wx += 5) {
+          if (Math.random() < 0.3) ctx.fillRect(wx, wy, 2, 2);
+        }
+      }
+    }
+
+    // ground
+    ctx.fillStyle = '#2a1a1a';
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = '#3a2a2a';
+    ctx.fillRect(0, GROUND_Y, W, 2);
+    // ground tiles
+    ctx.fillStyle = '#1a0a0a';
+    for (let x = 0; x < W; x += 8) {
+      ctx.fillRect(x, GROUND_Y + 4, 1, H - GROUND_Y - 4);
+    }
+    for (let y = GROUND_Y + 6; y < H; y += 6) {
+      ctx.fillRect(0, y, W, 1);
+    }
+  }
+
+  // ---------- GAME STATE ----------
+  const keys = {};
+  window.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+    if (e.code === 'Space' && (state.phase === 'result' || state.phase === 'ready')) {
+      resetRound();
+      state.phase = 'fight';
+      hideBanner();
+    }
+  });
+  window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+  const state = {
+    phase: 'ready', // ready | fight | result
+    round: 1,
+    p1: null,
+    p2: null
+  };
+
+  function createMecha(palette, x, facing, controls) {
+    return {
+      palette,
+      x, y: GROUND_Y - 32,
+      vx: 0, vy: 0,
+      w: 24, h: 32,
+      facing,
+      hp: 100,
+      controls,
+      onGround: true,
+      state: 'idle', // idle | walk | attack | defend | hit | jump
+      animFrame: 0,
+      animTimer: 0,
+      attackCooldown: 0,
+      hitCooldown: 0,
+      invincible: 0,
+      flash: false,
+      attackHit: false
+    };
+  }
+
+  function resetRound() {
+    state.p1 = createMecha('p1', 50, 'right', {
+      left: 'a', right: 'd', jump: 'w', attack: 'f', defend: 'g'
+    });
+    state.p2 = createMecha('p2', W - 50 - 24, 'left', {
+      left: 'arrowleft', right: 'arrowright', jump: 'arrowup', attack: 'j', defend: 'k'
+    });
+    state.phase = 'ready';
+    updateHUD();
+    showBanner('ROUND ' + state.round, 'FIGHT! 按 SPACE 继续', 1500);
+    setTimeout(() => {
+      if (state.phase === 'ready') {
+        state.phase = 'fight';
+        hideBanner();
+      }
+    }, 1500);
+  }
+
+  function showBanner(text, sub = '', duration = 0) {
+    const b = document.getElementById('banner');
+    b.innerHTML = text + (sub ? `<span class="sub">${sub}</span>` : '');
+    b.classList.add('show');
+    if (duration > 0) {
+      setTimeout(() => b.classList.remove('show'), duration);
+    }
+  }
+  function hideBanner() {
+    document.getElementById('banner').classList.remove('show');
+  }
+
+  function updateHUD() {
+    document.getElementById('hp-p1').style.width = Math.max(0, state.p1.hp) + '%';
+    document.getElementById('hp-p2').style.width = Math.max(0, state.p2.hp) + '%';
+  }
+
+  // ---------- GAME LOGIC ----------
+  function processInput(m) {
+    const c = m.controls;
+    let moving = false;
+
+    if (keys[c.left]) { m.vx = -1.6; m.facing = 'left'; moving = true; }
+    else if (keys[c.right]) { m.vx = 1.6; m.facing = 'right'; moving = true; }
+    else { m.vx = 0; }
+
+    m.defending = !!keys[c.defend] && m.onGround && m.attackCooldown === 0;
+
+    if (keys[c.jump] && m.onGround) {
+      m.vy = -9.2;
+      m.onGround = false;
+    }
+
+    if (keys[c.attack] && m.attackCooldown === 0 && !m.defending) {
+      m.state = 'attack';
+      m.animTimer = 0;
+      m.animFrame = 0;
+      m.attackCooldown = 45;
+      m.attackHit = false;
+    }
+
+    if (!m.onGround) m.state = 'jump';
+    else if (m.state === 'attack') { /* let animation finish */ }
+    else if (m.hitCooldown > 0) m.state = 'hit';
+    else if (m.defending) m.state = 'defend';
+    else if (moving) m.state = 'walk';
+    else m.state = 'idle';
+  }
+
+  function updatePhysics(m) {
+    m.vy += GRAVITY;
+    m.x += m.vx;
+    m.y += m.vy;
+
+    // clamp to ground
+    if (m.y + m.h >= GROUND_Y) {
+      m.y = GROUND_Y - m.h;
+      m.vy = 0;
+      m.onGround = true;
+    }
+
+    // clamp to screen
+    if (m.x < 4) m.x = 4;
+    if (m.x + m.w > W - 4) m.x = W - 4 - m.w;
+  }
+
+  function updateAnimation(m) {
+    m.animTimer++;
+    if (m.animTimer >= 6) {
+      m.animTimer = 0;
+      m.animFrame = (m.animFrame + 1) % 2;
+    }
+    if (m.attackCooldown > 0) m.attackCooldown--;
+    if (m.hitCooldown > 0) m.hitCooldown--;
+    if (m.invincible > 0) m.invincible--;
+    m.flash = m.hitCooldown > 0 && m.hitCooldown % 4 < 2;
+  }
+
+  function resolveAttacker(attacker, defender) {
+    // attack hitbox check during certain frames
+    if (attacker.state !== 'attack') return;
+
+    // attack active when animTimer in middle of animation
+    const active = attacker.attackCooldown > 20 && attacker.attackCooldown < 40;
+    if (!active || attacker.attackHit) return;
+
+    // hitbox in front of attacker
+    const reachX = attacker.facing === 'right'
+      ? attacker.x + attacker.w - 2
+      : attacker.x - 10;
+    const reachW = 12;
+
+    const ax1 = reachX, ax2 = reachX + reachW;
+    const dx1 = defender.x, dx2 = defender.x + defender.w;
+    const overlap = ax2 > dx1 && ax1 < dx2;
+    const yOverlap = attacker.y + 4 < defender.y + defender.h && attacker.y + attacker.h > defender.y + 4;
+
+    if (overlap && yOverlap && defender.invincible === 0) {
+      let dmg = 15 + Math.floor(Math.random() * 11); // 15-25
+      if (defender.defending) {
+        dmg = Math.max(2, Math.floor(dmg * 0.3));
+      }
+      defender.hp -= dmg;
+      defender.invincible = 20;
+      defender.hitCooldown = 25;
+      defender.state = 'hit';
+      // knockback
+      const kb = defender.defending ? 1.5 : 4;
+      defender.vx = attacker.facing === 'right' ? kb : -kb;
+      defender.vy = -2.5;
+      defender.onGround = false;
+      attacker.attackHit = true;
+      updateHUD();
+
+      if (defender.hp <= 0) {
+        endGame(attacker === state.p1 ? 'p1' : 'p2');
+      }
+    }
+  }
+
+  function endGame(winner) {
+    state.phase = 'result';
+    state.round++;
+    const name = winner === 'p1' ? 'P1 红方' : 'P2 蓝方';
+    showBanner(name + ' 胜利!', '按 SPACE 再来一局', 0);
+  }
+
+  // ---------- PARTICLES (hit sparks) ----------
+  const sparks = [];
+  function spawnSparks(x, y, color) {
+    for (let i = 0; i < 6; i++) {
+      sparks.push({
+        x, y,
+        vx: (Math.random() - 0.5) * 3,
+        vy: (Math.random() - 0.5) * 3 - 1,
+        life: 20,
+        color
+      });
+    }
+  }
+  function updateSparks() {
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.x += s.vx; s.y += s.vy;
+      s.vy += 0.2;
+      s.life--;
+      if (s.life <= 0) sparks.splice(i, 1);
+    }
+  }
+  function drawSparks() {
+    for (const s of sparks) {
+      ctx.fillStyle = s.color;
+      ctx.fillRect(Math.floor(s.x), Math.floor(s.y), 2, 2);
+    }
+  }
+
+  // ---------- GAME LOOP ----------
+  function getSpriteName(m) {
+    if (m.state === 'attack') return 'attack';
+    if (m.state === 'defend') return 'defend';
+    if (m.state === 'hit') return 'idle';
+    if (m.state === 'jump') return 'idle';
+    if (m.state === 'walk') return m.animFrame === 0 ? 'walk1' : 'walk2';
+    return 'idle';
+  }
+
+  function tick() {
+    // scale canvas rendering via CSS — we render at 320x180 and let CSS scale
+    ctx.save();
+    drawBackground();
+
+    if (state.phase === 'fight') {
+      [state.p1, state.p2].forEach(m => {
+        processInput(m);
+        updatePhysics(m);
+        updateAnimation(m);
+      });
+      resolveAttacker(state.p1, state.p2);
+      resolveAttacker(state.p2, state.p1);
+      updateSparks();
+    } else if (state.phase === 'ready' || state.phase === 'result') {
+      // Just animate idle mechas
+      if (state.p1 && state.p2) {
+        [state.p1, state.p2].forEach(m => updateAnimation(m));
+      }
+    }
+
+    // Draw mechas (and sparks on hit)
+    if (state.p1 && state.p2) {
+      for (const m of [state.p1, state.p2]) {
+        const spriteName = getSpriteName(m);
+        // slight shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.beginPath();
+        ctx.ellipse(m.x + m.w / 2, GROUND_Y + 1, m.w / 2, 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        drawSprite(spriteName, m.x, m.y, m.facing, m.palette, m.flash);
+      }
+      drawSparks();
+    }
+
+    ctx.restore();
+
+    requestAnimationFrame(tick);
+  }
+
+  // Set canvas scale via JS (match CSS)
+  function resize() {
+    const scale = SCALE;
+    canvas.style.width = (W * scale) + 'px';
+    canvas.style.height = (H * scale) + 'px';
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Start
+  resetRound();
+  tick();
+})();
+</script>
+</body>
+</html>
